@@ -30,6 +30,7 @@ use crate::util::toml_mut::dependency::Dependency;
 use crate::util::toml_mut::dependency::GitSource;
 use crate::util::toml_mut::dependency::MaybeWorkspace;
 use crate::util::toml_mut::dependency::PathSource;
+use crate::util::toml_mut::dependency::RegistrySource;
 use crate::util::toml_mut::dependency::Source;
 use crate::util::toml_mut::dependency::WorkspaceSource;
 use crate::util::toml_mut::manifest::DepTable;
@@ -873,6 +874,16 @@ impl std::ops::Deref for DependencyUI {
     }
 }
 
+fn is_wildcard_version(dependency: &Dependency) -> bool {
+    let Some(ref source) = dependency.source else {
+        return false;
+    };
+    match source {
+        Source::Registry(RegistrySource { version }) => version == "*",
+        _ => false,
+    }
+}
+
 /// Lookup available features
 fn populate_available_features(
     dependency: Dependency,
@@ -893,19 +904,42 @@ fn populate_available_features(
             std::task::Poll::Pending => registry.block_until_ready()?,
         }
     };
+
+    let is_wildcard_version = is_wildcard_version(&dependency);
+
+    fn is_better(s1: &Summary, s2: &Summary, is_wildcard_version: bool) -> bool {
+        // Fallback to a pre-release if no official release is available by sorting them as
+        // more.
+        let is_pre1 = !s1.version().pre.is_empty();
+        let is_pre2 = !s2.version().pre.is_empty();
+
+        match (is_pre1, is_pre2) {
+            (false, true) => true,
+            (true, false) => false,
+            _ => {
+                if is_wildcard_version {
+                    s1.version() > s2.version()
+                } else {
+                    s1.version() < s2.version()
+                }
+            }
+        }
+    }
+
     // Ensure widest feature flag compatibility by picking the earliest version that could show up
     // in the lock file for a given version requirement.
-    let lowest_common_denominator = possibilities
-        .iter()
-        .min_by_key(|s| {
-            // Fallback to a pre-release if no official release is available by sorting them as
-            // more.
-            let is_pre = !s.version().pre.is_empty();
-            (is_pre, s.version())
-        })
-        .ok_or_else(|| {
-            anyhow::format_err!("the crate `{dependency}` could not be found in registry index.")
-        })?;
+    // When the version is specified as '*' always use the latest version. 
+    let mut lowest_common_denominator = None;
+    for s in possibilities {
+        if lowest_common_denominator.as_ref().map_or(true, |prev| is_better(&s, prev, is_wildcard_version)) {
+            lowest_common_denominator = Some(s);
+        }
+    }
+
+    let Some(lowest_common_denominator) = lowest_common_denominator else {
+        return Err(anyhow::format_err!("the crate `{dependency}` could not be found in registry index."));
+    };
+
     dependency.apply_summary(&lowest_common_denominator);
 
     Ok(dependency)
